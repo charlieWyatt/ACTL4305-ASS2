@@ -1,0 +1,885 @@
+---
+title: "4305ass2"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+library(randomForest)
+library(rpart.plot)
+library(EnvStats)
+library(tidyverse)
+library(corrplot)
+library(ROSE)
+library(caret)
+library(vip)
+library(pdp)
+library(pROC)
+library(ROCR)
+library(kableExtra)
+
+library(parallel)
+library(doParallel)
+
+setwd("~/University/year3/T3/ACTL4305/Assignment/Assignment 2")
+
+```
+
+```{r dataSetup, warning=FALSE, message=FALSE, echo =FALSE}
+data <- read_csv("A2-data.csv")[,-1]
+
+factor_cols <- c("business.type", "driver.gender", "marital.status", "ncd.level", "region", "body.code", "fuel.type", "claim.count")
+data <- data %>% 
+  mutate_at(vars(factor_cols), funs(factor)) # makes all these factor variables
+
+```
+
+# Executive Summary
+
+
+# Data Exploration
+
+One aspect of the data, is that it considerably imbalanced, as seen from table 1. Therefore, the data will largely be explored by filtering in two ways - considering all the data and considering only the subset of the data where inviduals made a claim. Plots where all data is considered can at times be largely uninformative due to the high concentration of individuals with zero claims.
+
+```{r imbalance, include = FALSE}
+PropNoClaim <- sum(select(data, claim.incurred) == 0)/length(data$claim.incurred)
+PropClaimed <- sum(select(data, claim.incurred) != 0)/length(data$claim.incurred)
+
+ImbalanceTable <- matrix(c("0 Claims %", "At least 1 Claim %",round(PropNoClaim,2), round(PropClaimed,2)), ncol = 2, byrow = TRUE)
+knitr::kable(ImbalanceTable, caption = "Table 1: Data Imbalance", booktabs = TRUE) %>% 
+  kable_styling(font_size = 14, latex_options = "hold_position")
+```
+The significance of this imbalance can also be seen from the distribution of the claims incurred from individual policyholders in figures 1 and 2. It is clear that even when claimless individuals are removed, most of the claims are small.
+
+```{r echo= FALSE}
+par(mfrow=c(1,2))
+plot(density(data$claim.incurred), main = "Figure 1: Claim size distribution")
+plot(density(filter(data, claim.incurred > 0)$claim.incurred), main = "Figure 2: Claim size distribution - Zero claims removed")
+```
+This is an expected feature of most insurance data as accidents are rare events amoung individuals however, this can decrease the performance of future models and so the effects of imbalanced data will be a consideration during the modelling phase.
+
+This report will now consider some of the more interesting variable effects on pure premium.
+
+## Variable: Exposure
+Exposure seems to be somewhat correlated with the pure premium. As exposure increases, the severity of claims increases however, the pure premium will decrease suggesting that those who buy insurance in larger lengths of time are, on average, safer drivers.
+```{r boxandwhisker, echo = FALSE}
+  var <- "exposure"
+  data$exposureBins <- factor(cut(data$exposure, breaks = seq(0,1, 1/12)))
+  plot1 <- ggplot(filter(data, claim.incurred != 0)) +
+    geom_boxplot(aes(claim.incurred/exposure, colour= exposureBins)) +
+    labs(color=var) +
+    ggtitle(paste("Figure 3: Non-Zero Pure Premium and Claim Incurred for", var)) +
+    labs(x = "Pure Premium") +
+    theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+  plot2 <- ggplot(filter(data, claim.incurred != 0)) +
+    geom_boxplot(aes(claim.incurred, colour= exposureBins)) +
+    labs(color=var) +
+    ggtitle("") +
+    labs(x = "Claim Incurred") +
+    theme(legend.position = "none",
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+  
+  grid.arrange(plot1, plot2, ncol = 2)
+  data$exposureBins <- NULL
+  
+```
+
+## Variable: Driver Age
+Driver age is reflective of the general population in this data with 40 being the most common driving age as seen from Figure 5.
+```{r, echo = FALSE}
+plot(density(data$driver.age), main = "Figure 5: Age Distribution")
+```
+
+As expected, generally the worst drivers are those that are youngest and least experienced. Drivers begin to make more claims again when they become older as seen from the spikes in pure premium for elderly drivers in Figure 6.
+``` {r, echo = FALSE}
+data$ageBins <- factor(cut(data$driver.age, breaks = seq(0,100, 5)))
+AgeBins <- data %>% group_by(ageBins) %>% summarise("Average Pure Premium" = mean(claim.incurred/exposure))
+
+plot <- barplot(AgeBins$`Average Pure Premium`, main = "Figure 6. Pure Premium Across Driver Ages", names.arg=AgeBins$ageBins)
+data$ageBins <- NULL
+
+```
+
+
+## Variable: Prior Claims and NCD level
+As expected, there seems to be a positive trend between the number of past claims and the pure premium. The more claims the higher larger the pure premium is expected to be.
+``` {r, echo = FALSE}
+priorCount <- data %>% group_by(prior.claims) %>% summarise("Average Pure Premium" = mean(claim.incurred/exposure))
+plot <- barplot(priorCount$`Average Pure Premium`, main = "Figure 7. Pure Premium For Number of Prior Claims", names.arg=priorCount$prior.claims)
+
+```
+Interestingly, there seems to be little correlation between the No claim discount level and the number of prior claims as seen from figure 8, yet the prior NCD level still seems to be informative of the pure premium as the higher level of discount indicates smaller premiums as seen from figure 9. 
+```{r, echo = FALSE}
+# NCD level compared to prior claims
+priorAndNCD <- data %>% group_by(ncd.level) %>% summarise("Average Pure Premium" = mean(claim.incurred/exposure), "Average Prior Claim" = mean(prior.claims))
+par(mfrow = c(1,2))
+plot(priorAndNCD$ncd.level, priorAndNCD$`Average Prior Claim`, xlab = "NCD Level", ylab = "Average number of past claims", main = "Fig. 8 - NCD level vs Past Claims")
+plot(priorAndNCD$ncd.level, priorAndNCD$`Average Pure Premium`, xlab = "NCD Level", ylab = "Average Pure Premium", main = "Fig. 9 - NCD level vs Pure Premium")
+
+```
+
+
+## Variable: Year
+
+## Variable: Vehicle Value
+
+## Variable: Region
+
+## Correlation among features
+```{r, echo = FALSE}
+numeric_cols <- unlist(lapply(data, is.numeric))
+numeric_data <- na.omit(data[,numeric_cols])
+cor_data <- cor(numeric_data)
+```
+
+Although random forest is less affected by multicollinearality than other modelling processes, it is still an issue that needs to be addressed. From figure 10, there are some correlated terms, including -
+  * Vehicle Value and Vehicle Age at `r round(cor_data[which(colnames(cor_data)== "vehicle.value"), which(colnames(cor_data)== "vehicle.age")],2)`
+  * Weight and length at `r round(cor_data[which(colnames(cor_data)== "weight"), which(colnames(cor_data)== "length")],2)`
+  * Horsepower and length at `r round(cor_data[which(colnames(cor_data)== "horse.power"), which(colnames(cor_data)== "length")],2)`
+  * Horsepower and weight at `r round(cor_data[which(colnames(cor_data)== "horse.power"), which(colnames(cor_data)== "weight")],2)`
+  
+Therefore, weight, length and vehicle age were removed from the data.
+
+```{r pressure, echo=FALSE}
+
+corrplot(cor_data, method = "circle", main = "Figure 10 - Correlation Plot")
+# remove weight, length and vehicle age
+data <- data %>% select(-c(weight, length, vehicle.age)) 
+```
+
+
+## Data changes before modelling
+
+
+## R Markdown
+
+Since there seems to be two problems -> modelling frequency and modelling severity, I will try to replicate that to some extent
+
+Should also do some data exploration... 
+1. because its needed for the individual report
+2. Because it could reveal some helpful transformations
+
+
+MOSTLY LOOKING AT CV ERROR RATHER THAN OOB ERROR - should be stated
+Check discussion question week 9 for some more random forest examples
+Week 9 lectorial has some helpful exploratory analysis examples
+
+
+
+
+# Data Exploration
+```{r, echo = FALSE}
+str(data)
+```
+
+```{r outlierPlots, fig.align = "center", echo = FALSE, warning=FALSE}
+for(i in 1:ncol(data)) {
+  if(class(data[,i][[1]]) == "factor") {
+    var = paste0(colnames(data)[i])
+    par(mfrow=c(2,2))
+    plot <- plot(data[,i], main = var)
+  }
+}
+```
+
+
+## Effects of house characteristics on Agw and price
+```{r, echo = FALSE, warning=FALSE, fig.height = 4, echo = FALSE}
+par(mfrow=c(1,2))
+factorVar <- c(3, 5, 6, 8, 9, 10, 17, 19)
+for(i in factorVar) {
+  var <- colnames(data)[i]
+  plot <- ggplot(data) +
+    geom_point(aes(driver.age, claim.incurred, colour= factor(get(var)))) +
+    labs(color=var) +
+    ggtitle(paste("Effects of", var, "on Age vs Price"))
+  print(plot)
+}
+
+```
+
+```{r boxandwhisker, echo = FALSE}
+FactorData <- data[,c(factorVar, (which(colnames(data) == "claim.incurred")))]
+i = 1
+while(i < (length(FactorData)-1)) {
+  var1 <- colnames(FactorData)[i]
+  var2 <- colnames(FactorData)[i+1]
+  
+  plot1 <- ggplot(filter(FactorData, claim.incurred != 0)) +
+    geom_boxplot(aes(claim.incurred, colour= factor(get(var)))) +
+    labs(color=var) +
+    ggtitle(paste("Non-zero claims in", var))
+  plot2 <- ggplot(filter(FactorData, claim.incurred != 0)) +
+    geom_boxplot(aes(claim.incurred, colour= factor(get(var2)))) +
+    labs(color=var2) +
+    ggtitle(paste("Non-zero claims in", var2))
+  grid.arrange(plot1, plot2, ncol = 2)
+  i = i + 2
+}
+```
+
+
+
+```{r, echo = FALSE}
+set.seed(654321) 
+
+train.index=createDataPartition(data$claim.incurred, p = 0.7, list = FALSE)
+
+train=data[train.index,] 
+train <- train %>% select(-claim.count)
+
+
+test=data[-train.index,] 
+```
+# Loading all models
+```{r loadModels, include = FALSE}
+rpart0 <- readRDS(file = "Objects/zerosplitFinal.RData")
+rpart1 <- readRDS(file = "Objects/rpartFinal.RData")
+rf1 <- readRDS(file = "Objects/rfFinal.RData")
+treebag0 <- readRDS(file = "Objects/treebagFinal.RData")
+
+# intermediate models
+rf0 <- readRDS(file = "Objects/mtuneRF.RData")
+
+rf_1 <- readRDS(file = "Objects/rf_1.RData")
+for(i in 1:30) {
+  j <- i*100
+  model_name <- paste0("rf_", j)
+  print(model_name)
+  filename <- paste0("Objects/", model_name, ".RData")
+  assign(model_name, readRDS(file = filename))
+}
+rf_5000 <- readRDS(file = "Objects/rf_5000.RData")
+
+bagnodeData <- readRDS("Objects/bagnodeData.Rda")
+
+random_oob <- readRDS(file = "Objects/numTreeRF.RData")
+```
+# Methodology
+For each model, the hyperparamters were tuned through the Caret package and a 5 fold cross validation. 5 fold cross validation was deemed adequate enough to produce results that were significant whilst also having reasonably short enough run times. Even without repeated cross validation or higher folds, each random forest model could take an hour to run.
+```{r, include=FALSE}
+fitControl <- trainControl(
+    method = "cv", 
+    number = 5, 
+    allowParallel = TRUE) # parrallel computing saves run time
+```
+
+
+# Decision Tree
+The decision tree was the worst performing model, although it was only marginally worse than either random forest or bagging. The complexity parameter (CP) was tuned through a grid search and the best value was 0.004.
+
+```{r DecisionTree}
+plot(rpart1, main = "Decision Tree Complexity Parameter Tuning")
+
+rpart.plot(rpart1$finalModel) # requires rpart.plot package
+title("Rpart Decision Tree plot")
+
+bestcp <- rpart1$bestTune
+
+```
+Interestingly, any CP value greater than 0.007 produced a zero-split tree, which only had slightly worse predictive power than the standard tree. Therefore, this suggests that the decision tree is not a particularly strong model.
+``` {r zerosplitTree, include = FALSE}
+rpart0 <- train(claim.incurred ~., 
+               data = train, 
+               method = "rpart",
+               trControl = fitControl,
+               tuneGrid=expand.grid(cp=0.5))
+```
+
+## Decision Tree: Advantages
+The major advantage of the decision tree is its interpretability, it is clear that high exposure, more recent vehicles and younger drivers can all be indicative of higher claims. This is information is helpful for business decisions and to generalise individuals who may be seeking coverage.
+
+## Decision Tree: Disadvantages
+As shown from above, the decision tree is clearly a bad predictor
+
+## Decision Tree: Conclusion
+Although the basic decision tree has great interpretability and can be understood by people even without a statistical background, it is also the worst predictor, and since our chosen model will be used to price insurance products, accuracy has been prioritised over interpretability.
+
+
+# Random Forest
+There were 3 hyperparamters tuned for random forest- the number of trees, node size and the number of predictors considered at each tree split, commonly referred to as "m". Since random forest is computationally expensive, each predictor was optimised in isolation from the others. Although this is will not find the best combination of predictors, due to computational limitations it was a necessary tradeoff. 
+### Number of trees:
+Although random forest cannot be overfitted with large number of trees, in this data, any number of trees greater than 250 produced a relatively similar OOB error and so 250 was used for the final model. 
+``` {r numtreePlot, echo = FALSE}
+oob <- random_oob$finalModel$mse
+
+# compare error rates
+tibble::tibble(`Out of Bag Error`= oob,ntrees = 1:random_oob$finalModel$ntree)%>%
+    gather(Metric, Error, -ntrees) %>%
+    ggplot(aes(ntrees, Error)) +  
+    geom_line()+
+    xlab("Number of trees") +
+  ggtitle("RF MSE changes with number of trees")
+```
+
+Note: at 100 trees, the test error remains largely unchanged and so to create more models faster, 100 trees was deemed adequate enough to train the other parameters. 
+
+### Node Size
+Using the default node size value of 5 for regression in caret produced predictions that performed worse than even the standard regression tree. Therefore the node size also had to be trained in order to select the best bias-variance tradeoff. One of the limitations in this search was the computational cost of training each model. By incrementing the node size by 100 for each model, the optimal value was 2500, however, more training should be done for values greater than 3000 since it was unclear if there may have been early stopping. A value of 5000 was also used to validate that there was not any significant early stopping, however, more research should be done to ensure the most optimal node size was found.
+
+```{r rfTable}
+bignodesizeMSE <- as.data.frame(c(1, seq(100,3000,100), 5000))
+colnames(bignodesizeMSE)[1] <- "nodesize"
+bignodesizeMSE$mse <- c(rep(0, nrow(bignodesizeMSE)))
+bigbestnodeMSE <- Inf 
+bestmodel <- NULL
+for(i in 1:(nrow(bignodesizeMSE)-1)) {
+  j <- c(1,seq(100,3000,100))[i]
+  model <- paste0("rf_", j)
+  bignodesizeMSE[i, 2] = get(model)$finalModel$mse[100]
+  if(bignodesizeMSE[i, 2] < bigbestnodeMSE) {
+    bigbestnodesize <- j
+    bigbestnodeMSE <- bignodesizeMSE[i, 2]
+    bestmodel <- get(model)
+  }
+}
+# some hardcoding
+i = i+1
+j <- 5000
+bignodesizeMSE[i,2] <- rf_5000$finalModel$mse[100]
+if(bignodesizeMSE[i, 2] < bigbestnodeMSE) {
+    bigbestnodesize <- j
+    bigbestnodeMSE <- bignodesizeMSE[i, 2]
+}
+
+plot(bignodesizeMSE$nodesize, bignodesizeMSE$mse, type = "l", xlab = "Nodesize", ylab = "MSE", main = "Tuning node size: 100 tree RF")
+points(bigbestnodesize, bigbestnodeMSE, col = "red", pch = 19)
+```
+
+### Number of predictors considered at each split:
+M values between 1 and 51 were modelled and the value which minimised the CV error was 26.
+
+```{r bestMplot, echo = FALSE}
+bestm <- rf0$results$mtry[which.min(rf0$results$RMSE)]
+
+plot(rf0, main = "RF: Tuning Number of predictors used at each split")
+```
+Finally these values were combined to create the final random forest model. 
+
+
+## Random Forest: Advantages
+Best predictive power
+Has some interpretation from the VIP and PDPs.
+
+```{r impPlot, echo = FALSE}
+vip(rf1$finalModel) +
+  ggtitle("RF Variable Importance")
+
+RfExposure <-partial(rf1, pred.var = "exposure", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("RF: PDP of Exposure")
+RfYear <- partial(rf1, pred.var = "year", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("RF: PDP of Year")
+RfPriorClaims <- partial(rf1, pred.var = "prior.claims", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("RF: PDP of Prior Claims")
+RfAge <- partial(rf1, pred.var = "driver.age", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("RF: PDP of driver age")
+RfExposure
+RfYear
+RfPriorClaims
+RfAge
+```
+
+## Random Forest: Disadvantes
+Very computationally expensive
+Less resposive to new information - takes long time to retrain
+Loses interpretability
+Further investigation into the nodesize
+
+
+## Random Forest: Conclusion
+Overall, the random forest model was the best model. Although it was computationally slow to build and less interpretable than the decision tree, the improvements in the predictive power make up for these disadvantages. 
+
+# Bagging
+Bagging had to tune both the number of trees and the node size. However, since bagging is a subset of random forest, it was deemed appropriate to use 250 trees for both bagging and random forest. The main issue with fitting a bagging model was choosing the best node size. As seen from the plot below, there was no clear trend of the best node size. For future, more node size values should be tested. However, since bagging is growing a trees based on bootstrapped data, it was deemed appropriate to use the CP value found from the regression tree in part 1. This method also produced the lowest test RMSE. 
+
+``` {r bagPlots, echo = FALSE}
+bagbestnodesize <- bagnodeData$nodesize[which.min(bagnodeData$mse)]
+plot(bagnodeData$nodesize, bagnodeData$mse, type = "l", xlab = "Nodesize", ylab = "RMSE", main = "Tuning node size: 100 tree Bagging")
+points(bagbestnodesize, bagbestnodesize, col = "red", pch = 19)
+
+
+vip(treebag0) +
+  ggtitle("Bagging Variable Importance")
+
+partVehVal <- partial(treebag0, pred.var = "vehicle.value", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("Bagging: PDP of Vehicle Value")
+partAge <- partial(treebag0, pred.var = "driver.age", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("Bagging: PDP of driver age")
+partHeight <- partial(treebag0, pred.var = "height", grid.resolution = 20) %>% 
+  autoplot()  +
+  ggtitle("Bagging: PDP of height")
+```
+
+
+## Bagging: Advantages
+More accuracte than decision tree
+
+## Bagging: Disadvantages
+About same interpretability as random forest, still a worse predictor
+Computationally expensive, although not as bad as random forest since "m" value does not have to be trained
+
+## Bagging: Conclusion
+
+
+# Random forest strategy
+Since there is a computational time complexity constraint some of the hyper paremeters will be considered indivuadlly
+1. Find best number of trees
+2. Find best mtry value
+3. Find best node-size value
+4. Remove unimportant predictors.
+5. Repeat steps 2 and 3 and see if there is a difference
+(tbh not sure if steps 4 and 5 are needed since overfitting is not usually an issue with random forest)
+
+
+
+
+
+
+
+
+```{r predictions, echo = FALSE}
+predTable <- test %>% select(exposure, claim.incurred)
+predTable$zerosplit <- predict(rpart0, newdata = test)
+predTable$rpart <- predict(rpart1, newdata = test)
+predTable$rf <- predict(rf1, newdata = test)
+predTable$treebag <- predict(treebag0, newdata = test)
+predTable
+
+predPrem <- predTable
+predPrem$claim.incurred <- predPrem$claim.incurred/predPrem$exposure
+colnames(predPrem)[2] <- "pure.prem"
+predPrem$zerosplit <- predPrem$zerosplit/predPrem$exposure
+predPrem$rpart <- predPrem$rpart/predPrem$exposure
+predPrem$rf <- predPrem$rf/predPrem$exposure
+predPrem$treebag <- predPrem$treebag/predPrem$exposure
+predPrem
+```
+
+```{r testmse, echo = FALSE}
+test.errors <- as.data.frame(c("zero-split tree", "Rpart", "RandomForest", "Treebag"))
+test.errors$RMSE <- c(caret::RMSE(predPrem$zerosplit, predPrem$pure.prem),
+                      caret::RMSE(predPrem$rpart, predPrem$pure.prem),
+                      caret::RMSE(predPrem$rf, predPrem$pure.prem),
+                      caret::RMSE(predPrem$treebag, predPrem$pure.prem)
+                      )
+colnames(test.errors)[1] <- "Model"
+test.errors
+
+ggplot(test.errors) +
+  geom_point(aes(x = Model, y = RMSE)) +
+  ggtitle("Testing errors")
+```
+
+
+# Appendix
+
+## R code-
+```{r appendix, eval=FALSE}
+library(randomForest)
+library(rpart.plot)
+library(EnvStats)
+library(tidyverse)
+library(corrplot)
+library(ROSE)
+library(caret)
+library(vip)
+library(pdp)
+library(pROC)
+library(ROCR)
+
+library(parallel)
+library(doParallel)
+
+setwd("~/University/year3/T3/ACTL4305/Assignment/Assignment 2")
+
+# Importing data
+data <- read_csv("A2-data.csv")[,-1]
+
+factor_cols <- c("business.type", "driver.gender", "marital.status", "ncd.level", "region", "body.code", "fuel.type", "claim.count")
+data <- data %>% 
+  mutate_at(vars(factor_cols), funs(factor)) # makes all these factor variables
+
+
+# Brief data exploration
+str(data)
+
+par(mfrow=c(1,2))
+for(i in 1:ncol(data)) {
+  if(class(data[,i][[1]]) == "factor") {
+    var = paste0(colnames(data)[i])
+    plot <- plot(data[,i], main = var)
+  }
+}
+
+par(mfrow=c(1,2))
+plot(density(data$claim.incurred), main = "Claim size distribution")
+plot(density(filter(data, claim.incurred > 0)$claim.incurred), main = "Claim size distribution - No zero terms")
+
+## Collinearality check
+
+numeric_cols <- unlist(lapply(data, is.numeric))
+numeric_data <- na.omit(data[,numeric_cols])
+cor_data <- cor(numeric_data)
+corrplot(cor_data, method = "circle")
+
+# remove weight, length and vehicle age
+data <- data %>% select(-c(weight, length, vehicle.age)) 
+
+levels(data$claim.count)[6] <- "3"
+levels(data$claim.count)[5] <- "3"
+levels(data$claim.count)[4] <- "3+"
+
+## Effects of house characteristics on size and price
+par(mfrow=c(1,2))
+factorVar <- c(3, 5, 6, 8, 9, 10, 17, 19)
+for(i in factorVar) {
+  var <- colnames(data)[i]
+  plot <- ggplot(data) +
+    geom_point(aes(driver.age, claim.incurred, colour= factor(get(var)))) +
+    labs(color=var) +
+    ggtitle(paste("Effects of", var, "on Size vs Price"))
+  print(plot)
+}
+
+
+# Box and Whisker
+
+for(i in factorVar) {
+  var <- colnames(data)[i]
+  plot <- ggplot(filter(data, claim.incurred != 0)) +
+    geom_boxplot(aes(claim.incurred, colour= factor(get(var)))) +
+    labs(color=var) +
+    ggtitle(paste("Spread of non-zero claims across", var))
+  print(plot)
+}
+
+
+# Data Splitting
+set.seed(654321) 
+
+train.index=createDataPartition(data$claim.incurred, p = 0.7, list = FALSE)
+
+train=data[train.index,] 
+train <- train %>% select(-claim.count)
+
+
+test=data[-train.index,] 
+
+# Loading saved models
+rpart0 <- readRDS(file = "Objects/zerosplitFinal.RData")
+rpart1 <- readRDS(file = "Objects/rpartFinal.RData")
+rf1 <- readRDS(file = "Objects/rfFinal.RData")
+treebag0 <- readRDS(file = "Objects/treebagFinal.RData")
+rf0 <- readRDS(file = "Objects/mtuneRF.RData")
+rf_1 <- readRDS(file = "Objects/rf_1.RData")
+for(i in 1:30) {
+  j <- i*100
+  model_name <- paste0("rf_", j)
+  print(model_name)
+  filename <- paste0("Objects/", model_name, ".RData")
+  assign(model_name, readRDS(file = filename))
+}
+rf_5000 <- readRDS(file = "Objects/rf_5000.RData")
+bagnodeData <- readRDS("Objects/bagnodeData.Rda")
+random_oob <- readRDS(file = "Objects/numTreeRF.RData")
+
+
+# Caret's fit control parameter - held constant for duration of report
+fitControl <- trainControl(
+    method = "cv", 
+    number = 5, 
+    allowParallel = TRUE) # parrallel computing saves run time
+
+################ Decision Tree ################
+rpart.grid <- expand.grid(cp=seq(0,0.03,0.0005))
+rpart1 <- train(claim.incurred ~., 
+               data = train, 
+               method = "rpart",
+               trControl = fitControl,
+               tuneGrid=rpart.grid)
+
+plot(rpart1, main = "Decision Tree Complexity Parameter Tuning")
+
+rpart.plot(rpart1$finalModel) # requires rpart.plot package
+title("Rpart Decision Tree plot")
+
+bestcp <- rpart1$bestTune
+
+# Zero Split tree
+rpart0 <- train(claim.incurred ~., 
+               data = train, 
+               method = "rpart",
+               trControl = fitControl,
+               tuneGrid=expand.grid(cp=0.5))
+
+################ Random Forest ################
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+# To find optimal number of trees
+random_oob <- train(claim.incurred ~ ., data = train, 
+            method = "rf", 
+            trControl = fitControl,
+            ntree = 250,
+            nodesize = 2500)
+stopCluster(cluster)
+registerDoSEQ()
+
+# number of trees plot
+oob <- random_oob$finalModel$mse
+
+# compare error rates
+tibble::tibble(`Out of Bag Error`= oob,ntrees = 1:random_oob$finalModel$ntree)%>%
+    gather(Metric, Error, -ntrees) %>%
+    ggplot(aes(ntrees, Error)) +  
+    geom_line()+
+    xlab("Number of trees") +
+  ggtitle("RF MSE changes with number of trees")
+
+# Function to quickly create models with different sizes
+sizedRf <- function(size, train) {
+  cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+  registerDoParallel(cluster)
+  out <- train(claim.incurred ~ ., data = train, 
+            method = "rf", 
+            trControl = fitControl,
+            ntree = 100,
+            nodesize = size)
+  stopCluster(cluster)
+  registerDoSEQ()
+  out
+}
+
+maxNodesize <- 3000
+assign("rf_1", sizedRf(1, train))
+for(i in 1:(3000/100)) {
+  j <- i*100
+  model_name <- paste0("rf_", j)
+  print(model_name)
+  assign(model_name, sizedRf(j, train))
+}
+assign("rf_5000", sizedRf(5000, train))
+
+# Putting different node sizes into a table
+bignodesizeMSE <- as.data.frame(c(1, seq(100,3000,100), 5000))
+colnames(bignodesizeMSE)[1] <- "nodesize"
+bignodesizeMSE$mse <- c(rep(0, nrow(bignodesizeMSE)))
+bigbestnodeMSE <- Inf 
+bestmodel <- NULL
+for(i in 1:(nrow(bignodesizeMSE)-1)) {
+  j <- c(1,seq(100,3000,100))[i]
+  model <- paste0("rf_", j)
+  bignodesizeMSE[i, 2] = get(model)$finalModel$mse[100]
+  if(bignodesizeMSE[i, 2] < bigbestnodeMSE) {
+    bigbestnodesize <- j
+    bigbestnodeMSE <- bignodesizeMSE[i, 2]
+    bestmodel <- get(model)
+  }
+}
+# some hardcoding
+i = i+1
+j <- 5000
+bignodesizeMSE[i,2] <- rf_5000$finalModel$mse[100]
+if(bignodesizeMSE[i, 2] < bigbestnodeMSE) {
+    bigbestnodesize <- j
+    bigbestnodeMSE <- bignodesizeMSE[i, 2]
+}
+
+plot(bignodesizeMSE$nodesize, bignodesizeMSE$mse, type = "l", xlab = "Nodesize", ylab = "MSE", main = "Tuning node size: 100 tree RF")
+points(bigbestnodesize, bigbestnodeMSE, col = "red", pch = 19)
+
+# Tuning m paramter
+mtry <- bestmodel$bestTune$mtry
+rfGrid <-  expand.grid(.mtry=c(seq(1,51,5)))
+
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+rf0 <- train(claim.incurred ~ ., data = train, 
+            method = "rf", 
+            trControl = fitControl,
+            tuneGrid = rfGrid,
+            ntree = 250, 
+            nodesize = bigbestnodesize)
+stopCluster(cluster)
+registerDoSEQ()
+
+bestm <- rf0$results$mtry[which.min(rf0$results$RMSE)]
+plot(rf0, main = "RF: Tuning Number of predictors used at each split")
+
+
+# Best Random Forest model
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+rf1 <- train(claim.incurred ~ ., data = train, 
+            method = "rf", 
+            trControl = fitControl,
+            tuneGrid = expand.grid(.mtry = bestm),
+            ntree = 250,
+            nodesize = bigbestnodesize)
+stopCluster(cluster)
+registerDoSEQ()
+
+
+# VIP and PDP's for random forest
+vip(rf1$finalModel) +
+  ggtitle("RF Variable Importance")
+
+RfExposure <-partial(rf1, pred.var = "exposure", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("RF: PDP of Exposure")
+RfYear <- partial(rf1, pred.var = "year", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("RF: PDP of Year")
+RfPriorClaims <- partial(rf1, pred.var = "prior.claims", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("RF: PDP of Prior Claims")
+RfAge <- partial(rf1, pred.var = "driver.age", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("RF: PDP of driver age")
+RfExposure
+RfYear
+RfPriorClaims
+RfAge
+
+
+################ Bagging ################
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+treebag0 <- train(claim.incurred ~., 
+               data = train, 
+               method = "treebag",
+               trControl = fitControl,
+               ntree = 250,
+               control = rpart.control(cp = bestcp))
+stopCluster(cluster)
+registerDoSEQ()
+
+# Function to quickly model different sized bagged trees
+sizedBag <- function(size, train) {
+  cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+  registerDoParallel(cluster)
+  out <- train(claim.incurred ~ ., data = train, 
+            method = "treebag", 
+            trControl = fitControl,
+            ntree = 100,
+            nodesize = size)
+  stopCluster(cluster)
+  registerDoSEQ()
+  out
+}
+
+# Table with errors for the different nodesizes
+maxNodesize <- 30000
+nodeJumps <- 1000
+bagnodeData <- as.data.frame(c(seq(nodeJumps,maxNodesize,nodeJumps)))
+colnames(bagnodeData)[1] <- "nodesize"
+bagnodeData$mse <- c(rep(0, nrow(bagnodeData)))
+bagbestnodeMSE <- Inf 
+bestmodel <- NULL
+for(i in 1:(maxNodesize/nodeJumps)) {
+  j <- i*nodeJumps
+  model_name <- paste0("bag_", j)
+  print(model_name)
+  model <- sizedBag(j, train)
+  
+  bagnodeData[i, 2] = model$results[2]$RMSE
+  if(bagnodeData[i, 2] < bagbestnodeMSE) {
+    bagbestnodesize <- j
+    bagbestnodeMSE <- bagnodeData[i, 2]
+    bestmodel <- list(model, model_name)
+  }
+}
+
+
+# Bagging plots
+bagbestnodesize <- bagnodeData$nodesize[which.min(bagnodeData$mse)]
+plot(bagnodeData$nodesize, bagnodeData$mse, type = "l", xlab = "Nodesize", ylab = "RMSE", main = "Tuning node size: 100 tree Bagging")
+points(bagbestnodesize, bagbestnodesize, col = "red", pch = 19)
+
+
+# VIP and PDP plots for bagging
+vip(treebag0) +
+  ggtitle("Bagging Variable Importance")
+
+partVehVal <- partial(treebag0, pred.var = "vehicle.value", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("Bagging: PDP of Vehicle Value")
+partAge <- partial(treebag0, pred.var = "driver.age", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("Bagging: PDP of driver age")
+partHeight <- partial(treebag0, pred.var = "height", grid.resolution = 20) %>% 
+  autoplot()  +
+  ggtitle("Bagging: PDP of height")
+
+
+
+# Creating testing error predictions for the tables
+predTable <- test %>% select(exposure, claim.incurred)
+predTable$zerosplit <- predict(rpart0, newdata = test)
+predTable$rpart <- predict(rpart1, newdata = test)
+predTable$rf <- predict(rf1, newdata = test)
+predTable$treebag <- predict(treebag0, newdata = test)
+predTable
+
+predPrem <- predTable
+predPrem$claim.incurred <- predPrem$claim.incurred/predPrem$exposure
+colnames(predPrem)[2] <- "pure.prem"
+predPrem$zerosplit <- predPrem$zerosplit/predPrem$exposure
+predPrem$rpart <- predPrem$rpart/predPrem$exposure
+predPrem$rf <- predPrem$rf/predPrem$exposure
+predPrem$treebag <- predPrem$treebag/predPrem$exposure
+predPrem
+
+
+# Testing RMSE
+test.errors <- as.data.frame(c("zero-split tree", "Rpart", "RandomForest", "Treebag"))
+test.errors$RMSE <- c(caret::RMSE(predPrem$zerosplit, predPrem$pure.prem),
+                      caret::RMSE(predPrem$rpart, predPrem$pure.prem),
+                      caret::RMSE(predPrem$rf, predPrem$pure.prem),
+                      caret::RMSE(predPrem$treebag, predPrem$pure.prem)
+                      )
+colnames(test.errors)[1] <- "Model"
+test.errors
+
+ggplot(test.errors) +
+  geom_point(aes(x = Model, y = RMSE)) +
+  ggtitle("Testing errors")
+
+
+# Saving models so that the modelling process does not have to be rerun every time
+# Best models
+saveRDS(rpart0,file = "Objects/zerosplitFinal.RData")
+saveRDS(rpart1,file = "Objects/rpartFinal.RData")
+saveRDS(rf1,file = "Objects/rfFinal.RData")
+saveRDS(treebag0,file = "Objects/treebagFinal.RData")
+
+# intermediate models
+saveRDS(rf0, file = "Objects/mtuneRF.RData")
+
+saveRDS(rf_1, file = "Objects/rf_1.RData")
+for(i in 1:30) {
+  j <- i*100
+  model_name <- paste0("rf_", j)
+  print(model_name)
+  filename <- paste0("Objects/", model_name, ".RData")
+  saveRDS(get(model_name), file = filename)
+}
+saveRDS(rf_5000, file = "Objects/rf_5000.RData")
+
+saveRDS(bagnodeData, file="Objects/bagnodeData.Rda")
+
+saveRDS(random_oob, file = "Objects/numTreeRF.RData")
+```
+
+
+

@@ -1,0 +1,719 @@
+---
+title: "4305ass2"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(randomForest)
+library(rpart.plot)
+library(EnvStats)
+library(tidyverse)
+library(corrplot)
+library(ROSE)
+library(caret)
+library(vip)
+library(pdp)
+library(pROC)
+library(ROCR)
+
+library(parallel)
+library(doParallel)
+
+setwd("~/University/year3/T3/ACTL4305/Assignment/Assignment 2")
+
+```
+
+## R Markdown
+
+Since there seems to be two problems -> modelling frequency and modelling severity, I will try to replicate that to some extent
+
+Should also do some data exploration... 
+1. because its needed for the individual report
+2. Because it could reveal some helpful transformations
+
+
+MOSTLY LOOKING AT CV ERROR RATHER THAN OOB ERROR - should be stated
+Check discussion question week 9 for some more random forest examples
+Week 9 lectorial has some helpful exploratory analysis examples
+
+
+```{r dataSetup}
+data <- read_csv("A2-data.csv")[,-1]
+
+factor_cols <- c("business.type", "driver.gender", "marital.status", "ncd.level", "region", "body.code", "fuel.type", "claim.count")
+data <- data %>% 
+  mutate_at(vars(factor_cols), funs(factor)) # makes all these factor variables
+
+```
+
+# Data Exploration
+```{r}
+str(data)
+
+for(i in 1:ncol(data)) {
+  print(summary(data[,i]))
+}
+```
+
+```{r outlierPlots, fig.height = 3, fig.align = "center", echo = FALSE, warning=FALSE}
+par(mfrow=c(1,2))
+for(i in 1:ncol(data)) {
+  var = paste0(colnames(data)[i])
+  plot <- plot(data[,i], main = var)
+}
+```
+
+```{r}
+plot(density(data$claim.incurred), main = "Claim size distribution")
+plot(density(filter(data, claim.incurred > 0)$claim.incurred), main = "Claim size distribution - No zero terms")
+```
+
+
+
+```{r pressure, echo=FALSE}
+numeric_cols <- unlist(lapply(data, is.numeric))
+numeric_data <- na.omit(data[,numeric_cols])
+cor_data <- cor(numeric_data)
+corrplot(cor_data, method = "circle")
+
+# remove weight, length and vehicle age
+data <- data %>% select(-c(weight, length, vehicle.age)) 
+
+levels(data$claim.count)[6] <- "3"
+levels(data$claim.count)[5] <- "3"
+levels(data$claim.count)[4] <- "3+"
+
+```
+
+
+## Effects of house characteristics on size and price
+```{r, echo = FALSE, warning=FALSE, fig.height = 4}
+factorVar <- c(3, 5, 6, 8, 9, 10, 17, 19)
+for(i in factorVar) {
+  var <- colnames(data)[i]
+  plot <- ggplot(data) +
+    geom_point(aes(driver.age, claim.incurred, colour= factor(get(var)))) +
+    labs(color=var) +
+    ggtitle(paste("Effects of", var, "on Size vs Price"))
+  print(plot)
+}
+
+```
+
+```{r boxandwhisker}
+for(i in factorVar) {
+  var <- colnames(data)[i]
+  plot <- ggplot(filter(data, claim.incurred != 0)) +
+    geom_boxplot(aes(claim.incurred, colour= factor(get(var)))) +
+    labs(color=var) +
+    ggtitle(paste("Spread of non-zero claims across", var))
+  print(plot)
+}
+```
+
+```{r}
+# Proportion of zero claims for each factor
+```
+
+
+```{r}
+set.seed(654321) 
+
+train.index=createDataPartition(data$claim.incurred, p = 0.7, list = FALSE)
+
+train=data[train.index,] 
+train <- train %>% select(-claim.count)
+
+
+test=data[-train.index,] 
+```
+# Loading all models
+```{r}
+rpart0 <- readRDS(file = "Objects/zerosplitFinal.RData")
+rpart1 <- readRDS(file = "Objects/rpartFinal.RData")
+rf1 <- readRDS(file = "Objects/rfFinal.RData")
+treebag0 <- readRDS(file = "Objects/treebagFinal.RData")
+
+# intermediate models
+rf0 <- readRDS(file = "Objects/mtuneRF.RData")
+
+rf_1 <- readRDS(file = "Objects/rf_1.RData")
+for(i in 1:30) {
+  j <- i*100
+  model_name <- paste0("rf_", j)
+  print(model_name)
+  filename <- paste0("Objects/", model_name, ".RData")
+  assign(model_name, readRDS(file = filename))
+}
+rf_5000 <- readRDS(file = "Objects/rf_5000.RData")
+
+for(i in 1:30) {
+  j <- i*100
+  model_name <- paste0("bag_", j)
+  print(model_name)
+  filename <- paste0("Objects/", model_name, ".RData")
+  assign(model_name, readRDS(file = filename))
+}
+
+random_oob <- readRDS(file = "Objects/numTreeRF.RData")
+```
+
+# Modelling
+
+```{r rpart}
+fitControl <- trainControl(
+    method = "cv", 
+    number = 5, 
+    allowParallel = TRUE) # parrallel computing saves run time
+
+rpart.grid <- expand.grid(cp=seq(0,0.03,0.0005))
+# Should test a number of cp values 
+rpart1 <- train(claim.incurred ~., 
+               data = train, 
+               method = "rpart",
+               trControl = fitControl,
+               tuneGrid=rpart.grid)
+plot(rpart1, main = "Decision Tree Complexity Parameter Tuning")
+
+rpart.plot(rpart1$finalModel) # requires rpart.plot package
+title("Rpart Decision Tree plot")
+
+bestcp <- rpart1$bestTune
+
+rpart0 <- train(claim.incurred ~., 
+               data = train, 
+               method = "rpart",
+               trControl = fitControl,
+               tuneGrid=expand.grid(cp=0.5))
+
+rpart.plot(rpart0$finalModel) # requires rpart.plot package
+title("Rpart Decision Tree plot")
+
+```
+
+
+# Random forest strategy
+Since there is a computational time complexity constraint some of the hyper paremeters will be considered indivuadlly
+1. Find best number of trees
+2. Find best mtry value
+3. Find best node-size value
+4. Remove unimportant predictors.
+5. Repeat steps 2 and 3 and see if there is a difference
+(tbh not sure if steps 4 and 5 are needed since overfitting is not usually an issue with random forest)
+
+```{r rf}
+
+# this is only used for the ntree
+random_oob <- randomForest(claim.incurred ~., data = train, 
+                           xtest = select(test, -c(claim.incurred, claim.count)), 
+                           ytest = test$claim.incurred, 
+                           ntree = 500, keep.forest = TRUE) # keep.forest allows you to still do predictions
+
+oob <- random_oob$mse
+validation <-random_oob$test$mse
+# compare error rates
+tibble::tibble(`Out of Bag Error`= oob,`Test error`= validation,ntrees = 1:random_oob$ntree)%>%
+    gather(Metric, Error, -ntrees) %>%
+    ggplot(aes(ntrees, Error, color = Metric)) +  
+    geom_line()+
+    xlab("Number of trees") +
+  ggtitle("RF MSE changes with number of trees")
+
+
+sizedRf <- function(size, train, test) {
+  cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+  registerDoParallel(cluster)
+  out <- train(claim.incurred ~ ., data = train, 
+            method = "rf", 
+            trControl = fitControl,
+            ntree = 100,
+            nodesize = size)
+  stopCluster(cluster)
+  registerDoSEQ()
+  out
+}
+
+rf_1 <- sizedRf(1, train, test)
+rf_100 <- sizedRf(100, train, test)
+rf_200 <- sizedRf(200, train, test)
+rf_300 <- sizedRf(300, train, test)
+rf_400 <- sizedRf(400, train, test)
+rf_500 <- sizedRf(500, train, test)
+rf_600 <- sizedRf(600, train, test)
+rf_700 <- sizedRf(700, train, test)
+rf_800 <- sizedRf(800, train, test)
+rf_900 <- sizedRf(900, train, test)
+rf_1000 <- sizedRf(1000, train, test)
+rf_1100 <- sizedRf(1100, train, test)
+rf_1200 <- sizedRf(1200, train, test)
+rf_1300 <- sizedRf(1300, train, test)
+rf_1400 <- sizedRf(1400, train, test)
+rf_1500 <- sizedRf(1500, train, test)
+rf_1600 <- sizedRf(1600, train, test)
+rf_1700 <- sizedRf(1700, train, test)
+rf_1800 <- sizedRf(1800, train, test)
+rf_1900 <- sizedRf(1900, train, test)
+rf_2000 <- sizedRf(2000, train, test)
+rf_2100 <- sizedRf(2100, train, test)
+rf_2200 <- sizedRf(2200, train, test)
+rf_2300 <- sizedRf(2300, train, test)
+rf_2400 <- sizedRf(2400, train, test)
+rf_2500 <- sizedRf(2500, train, test)
+rf_2600 <- sizedRf(2600, train, test)
+rf_2700 <- sizedRf(2700, train, test)
+rf_2800 <- sizedRf(2800, train, test)
+rf_2900 <- sizedRf(2900, train, test)
+rf_3000 <- sizedRf(3000, train, test)
+
+rf_5000 <- sizedRf(5000, train, test)
+
+
+
+bignodesizeMSE <- as.data.frame(c(1, seq(100,3000,100), 5000))
+colnames(bignodesizeMSE)[1] <- "nodesize"
+bignodesizeMSE$mse <- c(rep(0, nrow(bignodesizeMSE)))
+bigbestnodeMSE <- Inf 
+bestmodel <- NULL
+for(i in 1:(nrow(bignodesizeMSE)-1)) {
+  j <- c(1,seq(100,3000,100))[i]
+  model <- paste0("rf_", j)
+  bignodesizeMSE[i, 2] = get(model)$finalModel$mse[100]
+  if(bignodesizeMSE[i, 2] < bigbestnodeMSE) {
+    bigbestnodesize <- j
+    bigbestnodeMSE <- bignodesizeMSE[i, 2]
+    bestmodel <- get(model)
+  }
+}
+# some hardcoding
+i = i+1
+j <- 5000
+bignodesizeMSE[i,2] <- rf_5000$finalModel$mse[100]
+if(bignodesizeMSE[i, 2] < bigbestnodeMSE) {
+    bigbestnodesize <- j
+    bigbestnodeMSE <- bignodesizeMSE[i, 2]
+}
+
+plot(bignodesizeMSE$nodesize, bignodesizeMSE$mse, type = "l", xlab = "Nodesize", ylab = "MSE", main = "Tuning node size: 100 tree RF")
+points(bigbestnodesize, bigbestnodeMSE, col = "red", pch = 19)
+
+
+
+
+
+mtry <- bestmodel$bestTune$mtry
+rfGrid <-  expand.grid(.mtry=c(seq(1,51,5)))
+
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+rf0 <- train(claim.incurred ~ ., data = train, 
+            method = "rf", 
+            trControl = fitControl,
+            tuneGrid = rfGrid,
+            ntree = 250, 
+            nodesize = bigbestnodesize)
+stopCluster(cluster)
+registerDoSEQ()
+
+bestm <- rf0$results$mtry[which.min(rf0$results$RMSE)]
+
+plot(rf0, main = "RF: Tuning Number of predictors used at each split")
+
+plot(rf0$results$mtry, rf0$results$RMSE, type = "l", xlab = "mtry", ylab = "RMSE", main = "Random Forest RMSE changes for m")
+points(rf0$results$mtry[which.min(rf0$results$RMSE)], min(rf0$results$RMSE), col = "red", pch = 16)
+
+
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+rf1 <- train(claim.incurred ~ ., data = train, 
+            method = "rf", 
+            trControl = fitControl,
+            tuneGrid = expand.grid(.mtry = bestm),
+            ntree = 250,
+            nodesize = bigbestnodesize)
+stopCluster(cluster)
+registerDoSEQ()
+
+
+vip(rf1$finalModel) +
+  ggtitle("RF Variable Importance")
+
+
+
+
+
+RfExposure <-partial(rf1, pred.var = "exposure", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("RF: PDP of Exposure")
+RfYear <- partial(rf1, pred.var = "year", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("RF: PDP of Year")
+RfPriorClaims <- partial(rf1, pred.var = "prior.claims", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("RF: PDP of Prior Claims")
+RfAge <- partial(rf1, pred.var = "driver.age", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("RF: PDP of driver age")
+
+```
+
+
+```{r}
+# Should test a number of cp values 
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+treebag0 <- train(claim.incurred ~., 
+               data = train, 
+               method = "treebag",
+               trControl = fitControl,
+               ntree = 250,
+               control = rpart.control(cp = bestcp))
+stopCluster(cluster)
+registerDoSEQ()
+
+sizedBag <- function(size, train) {
+  cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+  registerDoParallel(cluster)
+  out <- train(claim.incurred ~ ., data = train, 
+            method = "treebag", 
+            trControl = fitControl,
+            ntree = 100,
+            nodesize = size)
+  stopCluster(cluster)
+  registerDoSEQ()
+  out
+}
+
+
+maxNodesize <- 3000
+bagnodesizeMSE <- as.data.frame(c(seq(200,maxNodesize,200)))
+colnames(bagnodesizeMSE)[1] <- "nodesize"
+bagnodesizeMSE$mse <- c(rep(0, nrow(bagnodesizeMSE)))
+bagbestnodeMSE <- Inf 
+bestmodel <- NULL
+for(i in 1:(maxNodesize/200)) {
+  j <- i*200
+  model_name <- paste0("bag_", j)
+  print(model_name)
+  model <- sizedBag(j, train)
+  
+  bagnodesizeMSE[i, 2] = model$results[2]$RMSE
+  if(bagnodesizeMSE[i, 2] < bagbestnodeMSE) {
+    bagbestnodesize <- j
+    bagbestnodeMSE <- bagnodesizeMSE[i, 2]
+    bestmodel <- model_name
+  }
+}
+
+plot(bagnodesizeMSE$nodesize, bagnodesizeMSE$mse, type = "l", xlab = "Nodesize", ylab = "RMSE", main = "Tuning node size: 100 tree Bagging")
+points(bagbestnodesize, bagbestnodesize, col = "red", pch = 19)
+
+
+
+vip(treebag0) +
+  ggtitle("Bagging Variable Importance")
+
+partVehVal <- partial(treebag0, pred.var = "vehicle.value", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("Bagging: PDP of Vehicle Value")
+partAge <- partial(treebag0, pred.var = "driver.age", grid.resolution = 20) %>% 
+  autoplot() +
+  ggtitle("Bagging: PDP of driver age")
+partHeight <- partial(treebag0, pred.var = "height", grid.resolution = 20) %>% 
+  autoplot()  +
+  ggtitle("Bagging: PDP of height")
+```
+
+
+```{r predictions}
+predTable <- test %>% select(exposure, claim.incurred)
+predTable$zerosplit <- predict(rpart0, newdata = test)
+predTable$rpart <- predict(rpart1, newdata = test)
+predTable$rf <- predict(rf1, newdata = test)
+predTable$treebag <- predict(treebag0, newdata = test)
+predTable
+
+predPrem <- predTable
+predPrem$claim.incurred <- predPrem$claim.incurred/predPrem$exposure
+colnames(predPrem)[2] <- "pure.prem"
+predPrem$zerosplit <- predPrem$zerosplit/predPrem$exposure
+predPrem$rpart <- predPrem$rpart/predPrem$exposure
+predPrem$rf <- predPrem$rf/predPrem$exposure
+predPrem$treebag <- predPrem$treebag/predPrem$exposure
+predPrem
+```
+
+```{r testmse}
+test.errors <- as.data.frame(c("zero-split tree", "Rpart", "RandomForest", "Treebag"))
+test.errors$RMSE <- c(caret::RMSE(predPrem$zerosplit, predPrem$pure.prem),
+                      caret::RMSE(predPrem$rpart, predPrem$pure.prem),
+                      caret::RMSE(predPrem$rf, predPrem$pure.prem),
+                      caret::RMSE(predPrem$treebag, predPrem$pure.prem)
+                      )
+colnames(test.errors)[1] <- "Model"
+test.errors
+
+ggplot(test.errors) +
+  geom_point(aes(x = Model, y = RMSE)) +
+  ggtitle("Testing errors")
+```
+
+```{r savingModels}
+# Best models
+saveRDS(rpart0,file = "Objects/zerosplitFinal.RData")
+saveRDS(rpart1,file = "Objects/rpartFinal.RData")
+saveRDS(rf1,file = "Objects/rfFinal.RData")
+saveRDS(treebag0,file = "Objects/treebagFinal.RData")
+
+# intermediate models
+saveRDS(rf0, file = "Objects/mtuneRF.RData")
+
+saveRDS(rf_1, file = "Objects/rf_1.RData")
+for(i in 1:30) {
+  j <- i*100
+  model_name <- paste0("rf_", j)
+  print(model_name)
+  filename <- paste0("Objects/", model_name, ".RData")
+  saveRDS(get(model_name), file = filename)
+}
+saveRDS(rf_5000, file = "Objects/rf_5000.RData")
+
+for(i in 1:30) {
+  j <- i*100
+  model_name <- paste0("bag_", j)
+  print(model_name)
+  filename <- paste0("Objects/", model_name, ".RData")
+  saveRDS(get(model_name), file = filename)
+}
+
+saveRDS(random_oob, file = "Objects/numTreeRF.RData")
+```
+
+
+
+
+# Balancing Data
+
+Find which model can best classify wether an individual will claim or not
+Then use the model that can best predict the claim.incurred from those that claimed
+
+```{r}
+xtrain <- train %>% mutate("claimed" = as.factor(as.integer((claim.incurred != 0))))
+xtrain <- ROSE(claimed ~ ., data = xtrain, seed = 1)$data # use ROSE to balance the data 
+
+test <- test %>% mutate("claimed" = as.factor(as.integer((claim.incurred != 0))))
+
+xClaimedTrain <- xtrain %>% select(-claim.incurred)
+```
+
+```{r claimedRpart}
+claimRpart <- train(claimed ~., 
+               data = xClaimedTrain, 
+               method = "rpart",
+               trControl = fitControl,
+               tuneGrid=rpart.grid)
+```
+
+
+```{r claimedRF}
+# Train wether it can classify claim occurences first
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+claimRf <- train(claimed ~ ., data = xClaimedTrain, 
+                method = "rf", 
+                trControl = fitControl, 
+                verbose = FALSE,
+                tuneGrid = rfGrid,
+                ntree = 100)
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+```{r claimedBag}
+claimTreebag <- train(claimed ~., 
+               data = xClaimedTrain, 
+               method = "treebag",
+               trControl = fitControl,
+               ntree = 25,
+               control = rpart.control(cp = bestcp))
+```
+
+
+
+```{r probTable}
+claimProb <- test %>% select(claimed)
+claimProb$rpart <- predict(claimRpart, newdata = test, "prob")[2]
+claimProb$rf <- predict(claimRf, newdata = test, "prob")[2]
+claimProb$treebag <- predict(claimTreebag, newdata = test, "prob")[2]
+claimProb
+```
+
+
+```{r errorTable}
+claimTable <- test %>% select(claimed)
+claimTable$rpart <- predict(claimRpart, newdata = test, "raw")
+claimTable$rf <- predict(claimRf, newdata = test, "raw")
+claimTable$treebag <- predict(claimTreebag, newdata = test, "raw")
+claimTable
+```
+
+```{r ROC}
+plot(roc(response = claimTable$claimed, predictor = claimProb$rpart$`1`))
+lines(roc(response = claimTable$claimed, predictor = claimProb$rf$`1`), col = "red")
+lines(roc(response = claimTable$claimed, predictor = claimProb$treebag$`1`), col = "blue")
+```
+
+
+```{r}
+  confRpart <- confusionMatrix(claimTable$claimed, claimTable$rpart)
+  confRf <- confusionMatrix(claimTable$claimed, claimTable$rf)
+  confTreebag <- confusionMatrix(claimTable$claimed, claimTable$treebag)
+  
+  
+  if(confRpart$overall[1] > confRf$overall[1] && confRpart$overall[1] > confTreebag$overall[1]) {
+    bestModel <- list("model" = claimRpart, "accuracy" = confRpart$overall[1], "confMat" = confRpart)
+  } else if(confRf$overall[1] > confRpart$overall[1] && confRf$overall[1] > confTreebag$overall[1]) {
+    bestModel <- list("model" = claimRf, "accuracy" = confRf$overall[1], "confMat" = confRf)
+  } else {
+    bestModel <- list("model" = claimTreebag, "accuracy" = confTreebag$overall[1], "confMat" = confTreebag)
+  }
+```
+
+Use the random forest model to predict wether an individual claimed or not
+
+# Best model for claim size | claimed
+
+```{r sizeSetup}
+sizeTrain <- train %>% filter(claim.incurred > 0)
+```
+
+
+```{r sizeRpart}
+sizeRpart <- train(claim.incurred ~., 
+               data = sizeTrain, 
+               method = "rpart",
+               trControl = fitControl,
+               tuneGrid=rpart.grid)
+plot(sizeRpart)
+
+sizeBestCp <- sizeRpart$bestTune
+
+rpart.plot(sizeRpart$finalModel) # requires rpart.plot package
+title("Rpart Decision Tree plot")
+```
+
+```{r sizeRf}
+
+sizeRfGrid <- expand.grid(.mtry=c(1:ncol(sizeTrain)))
+
+
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+sizeRf <- train(claim.incurred ~ ., data = sizeTrain, 
+                method = "rf", 
+                trControl = fitControl, 
+                verbose = FALSE,
+                tuneGrid = sizeRfGrid,
+                ntree = 25)
+stopCluster(cluster)
+registerDoSEQ()
+
+sizeTreebag <- train(claim.incurred ~., 
+               data = sizeTrain, 
+               method = "treebag",
+               trControl = fitControl,
+               ntree = 25,
+               control = rpart.control(cp = sizeBestCp))
+```
+
+```{r}
+sizeTable <- test %>% filter(claim.incurred > 0) %>% select(exposure, claim.incurred)
+sizeTable$rpart <- predict(sizeRpart, newdata = filter(test, claim.incurred > 0))/sizeTable$exposure
+sizeTable$rf <- predict(sizeRf, newdata = filter(test, claim.incurred > 0))/sizeTable$exposure
+sizeTable$treebag <- predict(sizeTreebag, newdata = filter(test, claim.incurred > 0))/sizeTable$exposure
+colnames(sizeTable)[2] <- "pure.prem"
+
+# Should be combining with the other estimate of above for the ones that were predicted to be zero
+size.errors <- c()
+size.errors$rpart <- caret::RMSE(sizeTable$rpart, sizeTable$pure.prem)
+size.errors$rf <- caret::RMSE(sizeTable$rf, sizeTable$pure.prem)
+size.errors$treebag <- caret::RMSE(sizeTable$treebag, sizeTable$pure.prem)
+size.errors
+```
+
+```{r combinedTrees}
+combTest <- test
+combTest$id <- 1:nrow(test)
+
+combTest$pred <- as.numeric(predict(bestModel$model, newdata = test, "raw")) - 1
+
+sizeTest <- combTest %>% filter(pred == 1)
+sizeTest$pred <- predict(sizeRf, newdata = sizeTest)
+
+combTest[sizeTest$id, which(colnames(combTest) == "pred")] <- sizeTest$pred
+
+combTest <- combTest %>% mutate("pure.prem" = claim.incurred/exposure)
+combTest$pred <- combTest$pred/combTest$exposure
+
+caret::RMSE(combTest$pred, combTest$pure.prem)
+
+```
+
+well that didnt work...
+
+# Lets try to model claim count!
+This is too unbalanced, so it doesnt work...
+
+
+```{r countRpart}
+countTrain <- data[train.index,]
+
+countTrain <- countTrain %>% select(-claim.incurred) # cant use ROSE for multiclass data
+
+countRpart <- train(claim.count ~., 
+               data = countTrain, 
+               method = "rpart",
+               trControl = fitControl)
+countBestCp <- countRpart$bestTune
+
+# Random Forest
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+countRf <- train(claim.count ~ ., data = countTrain, 
+                method = "rf", 
+                trControl = fitControl, 
+                verbose = FALSE,
+                tuneGrid = rfGrid,
+                ntree = 25)
+stopCluster(cluster)
+registerDoSEQ()
+
+
+
+countTreebag <- train(claim.count ~., 
+               data = countTrain, 
+               method = "treebag",
+               trControl = fitControl,
+               control = rpart.control(countBestCp),
+               ntree = 25)
+```
+
+
+```{r}
+countTable <- test %>% select(exposure, claim.count)
+countTable$rpart <- predict(countRpart, newdata = test)
+countTable$rf <- predict(countRf, newdata = test)
+countTable$treebag <- predict(countTreebag, test)
+
+# Should be combining with the other estimate of above for the ones that were predicted to be zero
+count.misclas <- c()
+count.misclas$rpart <- sum(countTable$rpart!=countTable$claim.count)/length(countTable$claim.count)
+count.misclas$rf <- sum(countTable$rf!=countTable$claim.count)/length(countTable$claim.count)
+count.misclas$treebag <- sum(countTable$treebag!=countTable$claim.count)/length(countTable$claim.count)
+count.misclas
+```
+
+Feature selection is imbedded in the tree-based model process
+
+
+
+Number of obersvations and number of leaves for bagging hyperparameters
